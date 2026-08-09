@@ -33,30 +33,199 @@ function todayISO() {
   return new Date().toISOString().slice(0, 10);
 }
 
-async function findTripByChatId(chatId) {
+// Returns { trip } | { ambiguous: true, trips } | { trip: null } (no active trip for this chat)
+async function resolveTripForChat(chatId) {
+  const formula = `AND(
+    FIND(',${chatId},', ',' & ARRAYJOIN({ParticipantChatIDs}, ',') & ',') > 0,
+    IS_BEFORE({StartDate}, DATEADD(TODAY(), 1, 'days')),
+    IS_AFTER({EndDate}, DATEADD(TODAY(), -1, 'days'))
+  )`;
+  const url = `${AIRTABLE_BASE_URL}/Trips?filterByFormula=${encodeURIComponent(formula)}`;
+  const res = await fetch(url, { headers: airtableHeaders });
+  const data = await res.json();
+  const trips = data.records || [];
+
+  if (trips.length === 0) return { trip: null };
+  if (trips.length > 1) return { trip: null, ambiguous: true, trips };
+  return { trip: trips[0] };
+}
+
+async function findTripByCode(code) {
   const url = `${AIRTABLE_BASE_URL}/Trips?filterByFormula=${encodeURIComponent(
-    `{TelegramChatID}='${chatId}'`
+    `{TripCode}='${code}'`
   )}`;
   const res = await fetch(url, { headers: airtableHeaders });
   const data = await res.json();
   return data.records?.[0] || null;
 }
 
-async function joinTrip(chatId, code) {
-  if (!code) return null;
-  const url = `${AIRTABLE_BASE_URL}/Trips?filterByFormula=${encodeURIComponent(
-    `{TripCode}='${code}'`
+async function findParticipantByChatId(chatId) {
+  const url = `${AIRTABLE_BASE_URL}/Participants?filterByFormula=${encodeURIComponent(
+    `{ChatID}='${chatId}'`
   )}`;
   const res = await fetch(url, { headers: airtableHeaders });
   const data = await res.json();
-  const trip = data.records?.[0];
-  if (!trip) return null;
+  return data.records?.[0] || null;
+}
 
-  await fetch(`${AIRTABLE_BASE_URL}/Trips/${trip.id}`, {
+async function createParticipant(chatId) {
+  const res = await fetch(`${AIRTABLE_BASE_URL}/Participants`, {
+    method: 'POST',
+    headers: airtableHeaders,
+    body: JSON.stringify({ fields: { ChatID: String(chatId) } }),
+  });
+  return res.json();
+}
+
+async function getOrCreateParticipant(chatId) {
+  return (await findParticipantByChatId(chatId)) || (await createParticipant(chatId));
+}
+
+async function updateParticipant(participantId, fields) {
+  const res = await fetch(`${AIRTABLE_BASE_URL}/Participants/${participantId}`, {
     method: 'PATCH',
     headers: airtableHeaders,
-    body: JSON.stringify({ fields: { TelegramChatID: String(chatId) } }),
+    body: JSON.stringify({ fields }),
   });
+  return res.json();
+}
+
+// ---------------------------------------------------------------------------
+// /register — short step-by-step profile wizard, state kept on the
+// Participant's RegistrationStep field (mirrors the DailyQA open/answered pattern)
+// ---------------------------------------------------------------------------
+
+const REGISTRATION_STEPS = ['name', 'timezone', 'bio'];
+
+const REGISTRATION_PROMPTS = {
+  name: "Let's get you set up! What's your name?",
+  timezone: 'What timezone are you in? (e.g. America/New_York)',
+  bio: "Anything you'd like to share about yourself or your travel style? (reply 'skip' to skip)",
+};
+
+function nextRegistrationStep(step) {
+  const idx = REGISTRATION_STEPS.indexOf(step);
+  return REGISTRATION_STEPS[idx + 1] || null;
+}
+
+async function startRegistration(chatId) {
+  const participant = await getOrCreateParticipant(chatId);
+  const step = REGISTRATION_STEPS[0];
+  await updateParticipant(participant.id, { RegistrationStep: step });
+  return REGISTRATION_PROMPTS[step];
+}
+
+// Returns a reply string if this message was consumed as a registration answer, else null
+async function handleRegistrationReply(participant, text) {
+  const step = participant.fields.RegistrationStep;
+  if (!step) return null;
+
+  const fieldByStep = { name: 'Name', timezone: 'Timezone', bio: 'Bio' };
+  const fieldName = fieldByStep[step];
+  const skipped = step === 'bio' && text.trim().toLowerCase() === 'skip';
+
+  const next = nextRegistrationStep(step);
+  const updates = { RegistrationStep: next || '' };
+  if (!skipped) updates[fieldName] = text.trim();
+  await updateParticipant(participant.id, updates);
+
+  if (next) return REGISTRATION_PROMPTS[next];
+  return "You're all set! I've saved your profile.";
+}
+
+// ---------------------------------------------------------------------------
+// /trip --create — step-by-step new-trip wizard. Answers are collected as a
+// JSON draft on the Participant (nothing to PATCH until the Trip exists),
+// then the Trips record is created and the creator auto-joined to it.
+// ---------------------------------------------------------------------------
+
+const TRIP_CREATE_STEPS = ['code', 'startDate', 'endDate', 'planSummary', 'excitementNotes'];
+
+const TRIP_CREATE_PROMPTS = {
+  code: "Let's set up a new trip! What should the trip code be? (short and unique — people will use it with /join)",
+  startDate: "What's the start date? (YYYY-MM-DD)",
+  endDate: "What's the end date? (YYYY-MM-DD)",
+  planSummary: "Give a quick summary of the plan (or reply 'skip')",
+  excitementNotes: "What are you most looking forward to? (or reply 'skip')",
+};
+
+const TRIP_CREATE_FIELD_MAP = {
+  code: 'TripCode',
+  startDate: 'StartDate',
+  endDate: 'EndDate',
+  planSummary: 'PlanSummary',
+  excitementNotes: 'ExcitementNotes',
+};
+
+function nextTripCreateStep(step) {
+  const idx = TRIP_CREATE_STEPS.indexOf(step);
+  return TRIP_CREATE_STEPS[idx + 1] || null;
+}
+
+async function startTripCreation(chatId) {
+  const participant = await getOrCreateParticipant(chatId);
+  const step = TRIP_CREATE_STEPS[0];
+  await updateParticipant(participant.id, { TripCreationStep: step, TripCreationDraft: '{}' });
+  return TRIP_CREATE_PROMPTS[step];
+}
+
+// Returns a reply string if this message was consumed as a trip-creation answer, else null
+async function handleTripCreationReply(participant, text) {
+  const step = participant.fields.TripCreationStep;
+  if (!step) return null;
+
+  const trimmed = text.trim();
+  const skippable = step === 'planSummary' || step === 'excitementNotes';
+  const skipped = skippable && trimmed.toLowerCase() === 'skip';
+
+  if (step === 'code' && !skipped) {
+    const existing = await findTripByCode(trimmed);
+    if (existing) return `"${trimmed}" is already taken — try a different trip code.`;
+  }
+  if ((step === 'startDate' || step === 'endDate') && !skipped && !/^\d{4}-\d{2}-\d{2}$/.test(trimmed)) {
+    return `That doesn't look like YYYY-MM-DD — try again. ${TRIP_CREATE_PROMPTS[step]}`;
+  }
+
+  const draft = JSON.parse(participant.fields.TripCreationDraft || '{}');
+  if (!skipped) draft[TRIP_CREATE_FIELD_MAP[step]] = trimmed;
+
+  const next = nextTripCreateStep(step);
+  if (next) {
+    await updateParticipant(participant.id, { TripCreationStep: next, TripCreationDraft: JSON.stringify(draft) });
+    return TRIP_CREATE_PROMPTS[next];
+  }
+
+  const tripRes = await fetch(`${AIRTABLE_BASE_URL}/Trips`, {
+    method: 'POST',
+    headers: airtableHeaders,
+    body: JSON.stringify({ fields: draft }),
+  });
+  const trip = await tripRes.json();
+
+  const existingTripIds = (participant.fields.Trips || []).map((t) => (typeof t === 'string' ? t : t.id));
+  await updateParticipant(participant.id, {
+    TripCreationStep: '',
+    TripCreationDraft: '',
+    Trips: [...existingTripIds, trip.id],
+  });
+
+  return `Trip "${draft.TripCode}" is set up and you're linked to it! Share the code "${draft.TripCode}" so others can /join.`;
+}
+
+async function joinTrip(chatId, code) {
+  if (!code) return null;
+  const trip = await findTripByCode(code);
+  if (!trip) return null;
+
+  const participant = await getOrCreateParticipant(chatId);
+  const existingTripIds = (participant.fields.Trips || []).map((t) => (typeof t === 'string' ? t : t.id));
+  if (!existingTripIds.includes(trip.id)) {
+    await fetch(`${AIRTABLE_BASE_URL}/Participants/${participant.id}`, {
+      method: 'PATCH',
+      headers: airtableHeaders,
+      body: JSON.stringify({ fields: { Trips: [...existingTripIds, trip.id] } }),
+    });
+  }
   return trip;
 }
 
@@ -298,7 +467,43 @@ app.post('/webhook/telegram', async (req, res) => {
       return;
     }
 
-    const trip = await findTripByChatId(chatId);
+    if (text.startsWith('/register')) {
+      const prompt = await startRegistration(chatId);
+      await sendTelegramMessage(chatId, prompt);
+      return;
+    }
+
+    if (text.startsWith('/trip') && text.includes('--create')) {
+      const prompt = await startTripCreation(chatId);
+      await sendTelegramMessage(chatId, prompt);
+      return;
+    }
+
+    // Mid-wizard reply (plain text, not a command) takes priority over trip logic
+    if (text && !text.startsWith('/')) {
+      const participant = await findParticipantByChatId(chatId);
+      if (participant?.fields.RegistrationStep) {
+        const reply = await handleRegistrationReply(participant, text);
+        await sendTelegramMessage(chatId, reply);
+        return;
+      }
+      if (participant?.fields.TripCreationStep) {
+        const reply = await handleTripCreationReply(participant, text);
+        await sendTelegramMessage(chatId, reply);
+        return;
+      }
+    }
+
+    const resolved = await resolveTripForChat(chatId);
+    if (resolved.ambiguous) {
+      const codes = resolved.trips.map((t) => t.fields.TripCode).join(', ');
+      await sendTelegramMessage(
+        chatId,
+        `This chat is linked to more than one active trip right now (${codes}) — I can't tell which one this is for. Let me know which trip before sending more.`
+      );
+      return;
+    }
+    const trip = resolved.trip;
     if (!trip) {
       await sendTelegramMessage(chatId, "I don't recognize this chat yet — text /join <your trip code> to get started.");
       return;
