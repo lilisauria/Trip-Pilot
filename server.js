@@ -339,27 +339,36 @@ async function downloadTelegramFile(filePath) {
 }
 
 // ---------------------------------------------------------------------------
-// Pending caption tracking — if a photo arrives with no caption, the next
-// plain-text message from that chat (within PENDING_CAPTION_WINDOW_MS) is
-// treated as its location/description instead of a standalone note.
-// In-memory only (matches this app's no-persistence-beyond-Airtable design)
-// — lost on restart, and a second captionless photo before the reply lands
-// simply replaces the pending target (the first stays uncaptioned).
+// Pending caption tracking — if a photo arrives with no caption, it's queued
+// per chat; each subsequent plain-text message (within
+// PENDING_CAPTION_WINDOW_MS) is consumed FIFO as that queue's next photo's
+// location/description, so multiple uncaptioned photos sent back-to-back
+// each get matched to their own reply in send order. In-memory only
+// (matches this app's no-persistence-beyond-Airtable design) — lost on
+// restart, and any entry not claimed within the window is simply skipped.
 // ---------------------------------------------------------------------------
 
 const PENDING_CAPTION_WINDOW_MS = 10 * 60 * 1000;
-const pendingCaptionByChat = new Map();
+const pendingCaptionsByChat = new Map();
 
 function setPendingCaption(chatId, recordId) {
-  pendingCaptionByChat.set(chatId, { recordId, expiresAt: Date.now() + PENDING_CAPTION_WINDOW_MS });
+  const queue = pendingCaptionsByChat.get(chatId) || [];
+  queue.push({ recordId, expiresAt: Date.now() + PENDING_CAPTION_WINDOW_MS });
+  pendingCaptionsByChat.set(chatId, queue);
 }
 
 function takePendingCaption(chatId) {
-  const pending = pendingCaptionByChat.get(chatId);
-  if (!pending) return null;
-  pendingCaptionByChat.delete(chatId);
-  if (Date.now() > pending.expiresAt) return null;
-  return pending.recordId;
+  const queue = pendingCaptionsByChat.get(chatId);
+  if (!queue) return null;
+  while (queue.length) {
+    const next = queue.shift();
+    if (Date.now() <= next.expiresAt) {
+      if (!queue.length) pendingCaptionsByChat.delete(chatId);
+      return next.recordId;
+    }
+  }
+  pendingCaptionsByChat.delete(chatId);
+  return null;
 }
 
 // ---------------------------------------------------------------------------
