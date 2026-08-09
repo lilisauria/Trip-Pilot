@@ -264,6 +264,14 @@ async function attachMediaToCapture(recordId, base64, contentType, filename) {
   return { ok: true, data };
 }
 
+async function updateCaptureCaption(recordId, caption) {
+  await fetch(`${AIRTABLE_BASE_URL}/Captures/${recordId}`, {
+    method: 'PATCH',
+    headers: airtableHeaders,
+    body: JSON.stringify({ fields: { CaptionText: caption } }),
+  });
+}
+
 async function getTodaysCaptures(tripId, date) {
   const formula = `AND({TripID}='${tripId}', {Date}='${date}')`;
   const url = `${AIRTABLE_BASE_URL}/Captures?filterByFormula=${encodeURIComponent(
@@ -328,6 +336,30 @@ async function getFilePath(fileId) {
 async function downloadTelegramFile(filePath) {
   const res = await fetch(`${TELEGRAM_FILE_API}/${filePath}`);
   return res.buffer();
+}
+
+// ---------------------------------------------------------------------------
+// Pending caption tracking — if a photo arrives with no caption, the next
+// plain-text message from that chat (within PENDING_CAPTION_WINDOW_MS) is
+// treated as its location/description instead of a standalone note.
+// In-memory only (matches this app's no-persistence-beyond-Airtable design)
+// — lost on restart, and a second captionless photo before the reply lands
+// simply replaces the pending target (the first stays uncaptioned).
+// ---------------------------------------------------------------------------
+
+const PENDING_CAPTION_WINDOW_MS = 10 * 60 * 1000;
+const pendingCaptionByChat = new Map();
+
+function setPendingCaption(chatId, recordId) {
+  pendingCaptionByChat.set(chatId, { recordId, expiresAt: Date.now() + PENDING_CAPTION_WINDOW_MS });
+}
+
+function takePendingCaption(chatId) {
+  const pending = pendingCaptionByChat.get(chatId);
+  if (!pending) return null;
+  pendingCaptionByChat.delete(chatId);
+  if (Date.now() > pending.expiresAt) return null;
+  return pending.recordId;
 }
 
 // ---------------------------------------------------------------------------
@@ -564,18 +596,30 @@ app.post('/webhook/telegram', async (req, res) => {
         );
         return;
       }
-      await sendTelegramMessage(chatId, '📸 Got it, saved.');
+      if (message.caption) {
+        await sendTelegramMessage(chatId, '📸 Got it, saved.');
+      } else {
+        setPendingCaption(chatId, record.id);
+        await sendTelegramMessage(chatId, "📸 Got it! Where was this / what was it? (or just keep going, no rush)");
+      }
       return;
     }
 
-    // Text only, not a command -> either an answer to today's open questions, or a loose note
+    // Text only, not a command -> answer to today's open questions, the location/description
+    // for a just-sent uncaptioned photo, or a loose note, in that priority order
     if (text) {
       const openQA = await getOpenDailyQA(trip.id, date);
       if (openQA) {
         await appendAnswer(openQA.id, openQA.fields.RepliesRaw, text);
-      } else {
-        await createCaptureRecord({ tripId: trip.id, date, timestamp, caption: text, mediaType: 'note' });
+        return;
       }
+      const pendingRecordId = takePendingCaption(chatId);
+      if (pendingRecordId) {
+        await updateCaptureCaption(pendingRecordId, text);
+        await sendTelegramMessage(chatId, `📍 Tagged: ${text}`);
+        return;
+      }
+      await createCaptureRecord({ tripId: trip.id, date, timestamp, caption: text, mediaType: 'note' });
     }
   } catch (err) {
     console.error('Webhook error:', err);
