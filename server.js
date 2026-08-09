@@ -246,14 +246,22 @@ async function createCaptureRecord({ tripId, date, timestamp, caption, mediaType
   return res.json();
 }
 
+// Returns { ok: true, data } on success, { ok: false, error } if the upload
+// itself failed (bad host, bad auth, Airtable-side error, etc.) — callers
+// must check `ok` rather than assume the attachment landed.
 async function attachMediaToCapture(recordId, base64, contentType, filename) {
-  const url = `${AIRTABLE_BASE_URL}/Captures/${recordId}/Media/uploadAttachment`;
+  // Attachment uploads are served from a different host than record CRUD.
+  const url = `https://content.airtable.com/v0/${AIRTABLE_BASE_ID}/${recordId}/Media/uploadAttachment`;
   const res = await fetch(url, {
     method: 'POST',
     headers: airtableHeaders,
     body: JSON.stringify({ contentType, filename, file: base64 }),
   });
-  return res.json();
+  const data = await res.json();
+  if (!res.ok || data.error) {
+    return { ok: false, error: data.error || `HTTP ${res.status}` };
+  }
+  return { ok: true, data };
 }
 
 async function getTodaysCaptures(tripId, date) {
@@ -542,12 +550,20 @@ app.post('/webhook/telegram', async (req, res) => {
         caption: message.caption || '',
         mediaType: 'photo',
       });
-      await attachMediaToCapture(
+      const attachResult = await attachMediaToCapture(
         record.id,
         buffer.toString('base64'),
         isImageDoc ? doc.mime_type : 'image/jpeg',
         `capture_${Date.now()}.jpg`
       );
+      if (!attachResult.ok) {
+        console.error('Media attach failed:', JSON.stringify(attachResult.error));
+        await sendTelegramMessage(
+          chatId,
+          "⚠️ I saved your note but the photo itself failed to upload — can you resend it? (If this keeps happening, let the trip organizer know.)"
+        );
+        return;
+      }
       await sendTelegramMessage(chatId, '📸 Got it, saved.');
       return;
     }

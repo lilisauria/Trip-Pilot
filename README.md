@@ -205,6 +205,34 @@ Text your bot `/trip --create` and follow the prompts (or pre-create a
 test photos, text `DONE`, and confirm the question list comes back and the
 data landed correctly in Airtable.
 
+## Exporting a trip for storybook writing
+
+Once a trip is over, run:
+
+```bash
+npm run export -- <tripCode>
+```
+
+This pulls every `Captures` and `DailyQA` row for that trip directly from
+Airtable, sorts everything chronologically, downloads every photo locally,
+and writes to `exports/<tripCode>/`:
+
+- **`manuscript.md`** — a day-by-day, time-ordered document: each photo
+  (with the caption/location you typed), each loose text note, and each
+  day's wrap-up questions plus the raw replies. This is the file meant to
+  be pasted into Claude (or handed to any writer) as the raw material for
+  the AI-generated storybook — no manual reassembly of photos and notes
+  needed.
+- **`manuscript.json`** — the same data in structured form, in case you
+  want to script the storybook-generation step later instead of doing it
+  by hand.
+- **`images/`** — every photo, named `<date>_<time>_<recordId>.<ext>`, in
+  chronological order alongside the Markdown.
+
+The `exports/` folder is gitignored — it's meant to be a local working
+copy, not committed. The script is read-only against Airtable; it never
+modifies any records.
+
 ## Known limitations
 
 - **Answer alignment is manual-ish** — replies to a day's questions are

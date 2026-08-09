@@ -5,7 +5,8 @@
   "description": "15-day Telegram trip-journaling pilot: Telegram Bot API + Claude + Airtable",
   "main": "server.js",
   "scripts": {
-    "start": "node server.js"
+    "start": "node server.js",
+    "export": "node export-trip.js"
   },
   "dependencies": {
     "@anthropic-ai/sdk": "^0.32.0",
