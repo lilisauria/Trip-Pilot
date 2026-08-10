@@ -637,4 +637,76 @@ app.post('/webhook/telegram', async (req, res) => {
 
 app.get('/health', (_req, res) => res.send('ok'));
 
+// ---------------------------------------------------------------------------
+// Daily prompt — one rotating question per trip per day, sent proactively.
+// Any reply (whether it answers the question or not) just flows through the
+// normal text handler above and lands as a note capture — no separate
+// answer-tracking needed, by design.
+//
+// Per-trip send time/timezone is a hardcoded config below rather than an
+// Airtable field, since trips are created one at a time in this POC and this
+// avoids an Airtable schema change. Add an entry here for each new trip.
+// ---------------------------------------------------------------------------
+
+const DAILY_PROMPT_TRIPS = {
+  Smokey: { timezone: 'America/New_York', hour: 19 },
+};
+
+const DAILY_PROMPT_POOL = [
+  "What's one moment from today you already know you'll be telling people about back home?",
+  "What's the best (or strangest) thing you ate today?",
+  "What's something about how people live here that felt different from home?",
+  "Anything not go as planned today — and how'd you handle it?",
+  'Tell me about someone you met or noticed today — a local, a stranger, anyone.',
+  'If today had a title, what would it be?',
+  'Best part / worst part of today?',
+];
+
+function localHourInTZ(timezone, date = new Date()) {
+  const parts = new Intl.DateTimeFormat('en-US', { timeZone: timezone, hour: 'numeric', hour12: false }).formatToParts(date);
+  return parseInt(parts.find((p) => p.type === 'hour').value, 10) % 24;
+}
+
+function localDateISOInTZ(timezone, date = new Date()) {
+  return new Intl.DateTimeFormat('en-CA', { timeZone: timezone, year: 'numeric', month: '2-digit', day: '2-digit' }).format(date);
+}
+
+function pickDailyQuestion(trip, todayLocal) {
+  const daysSinceStart = Math.floor((new Date(todayLocal) - new Date(trip.fields.StartDate)) / 86400000);
+  const idx = ((daysSinceStart % DAILY_PROMPT_POOL.length) + DAILY_PROMPT_POOL.length) % DAILY_PROMPT_POOL.length;
+  return DAILY_PROMPT_POOL[idx];
+}
+
+// tripCode -> local date (YYYY-MM-DD) already sent, so a tick that fires
+// more than once within the same minute (or a restart at :00) can't double-send
+const dailyPromptSentFor = new Map();
+
+async function dailyPromptTick() {
+  for (const [tripCode, config] of Object.entries(DAILY_PROMPT_TRIPS)) {
+    try {
+      const hour = localHourInTZ(config.timezone);
+      if (hour !== config.hour) continue;
+
+      const todayLocal = localDateISOInTZ(config.timezone);
+      if (dailyPromptSentFor.get(tripCode) === todayLocal) continue;
+
+      const trip = await findTripByCode(tripCode);
+      if (!trip) continue;
+      if (todayLocal < trip.fields.StartDate || todayLocal > trip.fields.EndDate) continue;
+
+      const question = pickDailyQuestion(trip, todayLocal);
+      const message = `🌙 Today's question: ${question}\n\nOr just tell me whatever's on your mind about today — no wrong answers, one word or a whole paragraph, up to you.`;
+
+      for (const chatId of trip.fields.ParticipantChatIDs || []) {
+        await sendTelegramMessage(chatId, message);
+      }
+      dailyPromptSentFor.set(tripCode, todayLocal);
+    } catch (err) {
+      console.error(`Daily prompt failed for ${tripCode}:`, err);
+    }
+  }
+}
+
+setInterval(dailyPromptTick, 60 * 1000);
+
 app.listen(PORT, () => console.log(`Listening on ${PORT}`));
